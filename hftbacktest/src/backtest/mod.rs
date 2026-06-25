@@ -36,7 +36,7 @@ use crate::{
         UNTIL_END_OF_DATA,
         WaitOrderResponse,
     },
-    types::{BuildError, ElapseResult, Event},
+    types::{BuildError, ElapseResult, Event, LOCAL_TRADE_EVENT},
 };
 
 /// Provides asset types.
@@ -594,6 +594,8 @@ impl<MD> BacktestBuilder<MD> {
             evs: EventSet::new(num_assets),
             local: self.local,
             exch: self.exch,
+            market_feed_updates: Vec::with_capacity(num_assets),
+            market_feed_update_pos: vec![None; num_assets],
         })
     }
 }
@@ -606,6 +608,21 @@ pub struct Backtest<MD> {
     evs: EventSet,
     local: Vec<BacktestProcessorState<Box<dyn LocalProcessor<MD>>>>,
     exch: Vec<BacktestProcessorState<Box<dyn Processor>>>,
+    market_feed_updates: Vec<MarketFeedUpdate>,
+    market_feed_update_pos: Vec<Option<usize>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MarketFeedUpdate {
+    pub asset_no: usize,
+    pub exch_ts: i64,
+    pub local_ts: i64,
+    pub trade_seen: bool,
+    pub bbo_changed: bool,
+    pub best_bid: f64,
+    pub best_bid_qty: f64,
+    pub best_ask: f64,
+    pub best_ask_qty: f64,
 }
 
 impl<P: Processor> Deref for BacktestProcessorState<P> {
@@ -708,6 +725,30 @@ where
             exch,
             cur_ts: i64::MAX,
             evs: EventSet::new(num_assets),
+            market_feed_updates: Vec::with_capacity(num_assets),
+            market_feed_update_pos: vec![None; num_assets],
+        }
+    }
+
+    pub fn drain_market_feed_updates(&mut self, out: &mut Vec<MarketFeedUpdate>) {
+        out.extend(self.market_feed_updates.drain(..));
+        self.market_feed_update_pos.fill(None);
+    }
+
+    fn record_market_feed_update(&mut self, update: MarketFeedUpdate) {
+        if let Some(pos) = self.market_feed_update_pos[update.asset_no] {
+            let old = &mut self.market_feed_updates[pos];
+            old.exch_ts = update.exch_ts;
+            old.local_ts = update.local_ts;
+            old.trade_seen |= update.trade_seen;
+            old.bbo_changed |= update.bbo_changed;
+            old.best_bid = update.best_bid;
+            old.best_bid_qty = update.best_bid_qty;
+            old.best_ask = update.best_ask;
+            old.best_ask_qty = update.best_ask_qty;
+        } else {
+            self.market_feed_update_pos[update.asset_no] = Some(self.market_feed_updates.len());
+            self.market_feed_updates.push(update);
         }
     }
 
@@ -774,11 +815,49 @@ where
                     }
                     match ev.kind {
                         EventIntentKind::LocalData => {
-                            let local = unsafe { self.local.get_unchecked_mut(ev.asset_no) };
-                            let next = local.next_row().and_then(|row| {
-                                local.processor.process(&local.data[row])?;
-                                local.advance()
-                            });
+                            let (next, update) = {
+                                let local = unsafe { self.local.get_unchecked_mut(ev.asset_no) };
+                                match local.next_row() {
+                                    Ok(row) => {
+                                        let event = &local.data[row];
+                                        let depth = local.processor.depth();
+                                        let before = (
+                                            depth.best_bid(),
+                                            depth.best_bid_qty(),
+                                            depth.best_ask(),
+                                            depth.best_ask_qty(),
+                                        );
+
+                                        local.processor.process(event)?;
+
+                                        let depth = local.processor.depth();
+                                        let after = (
+                                            depth.best_bid(),
+                                            depth.best_bid_qty(),
+                                            depth.best_ask(),
+                                            depth.best_ask_qty(),
+                                        );
+                                        let update = MarketFeedUpdate {
+                                            asset_no: ev.asset_no,
+                                            exch_ts: event.exch_ts,
+                                            local_ts: event.local_ts,
+                                            trade_seen: event.is(LOCAL_TRADE_EVENT),
+                                            bbo_changed: before != after,
+                                            best_bid: after.0,
+                                            best_bid_qty: after.1,
+                                            best_ask: after.2,
+                                            best_ask_qty: after.3,
+                                        };
+
+                                        (local.advance(), Some(update))
+                                    }
+                                    Err(e) => (Err(e), None),
+                                }
+                            };
+
+                            if let Some(update) = update {
+                                self.record_market_feed_update(update);
+                            }
 
                             match next {
                                 Ok(next_ts) => {
@@ -1161,8 +1240,47 @@ mod test {
         },
         depth::HashMapMarketDepth,
         prelude::{Bot, Event},
-        types::{EXCH_EVENT, LOCAL_EVENT},
+        types::{
+            EXCH_EVENT,
+            LOCAL_ASK_DEPTH_EVENT,
+            LOCAL_BID_DEPTH_EVENT,
+            LOCAL_BUY_TRADE_EVENT,
+            LOCAL_EVENT,
+        },
     };
+
+    fn event(ev: u64, ts: i64, px: f64, qty: f64) -> Event {
+        Event {
+            ev,
+            exch_ts: ts,
+            local_ts: ts,
+            px,
+            qty,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }
+    }
+
+    fn build_l2_backtest(
+        data: Vec<Vec<Event>>,
+    ) -> Result<Backtest<HashMapMarketDepth>, Box<dyn Error>> {
+        let mut builder = Backtest::builder();
+        for events in data {
+            builder = builder.add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::Data(Data::from_data(&events))])
+                    .latency_model(ConstantLatency::new(0, 0))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+                    .exchange(NoPartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?,
+            );
+        }
+        Ok(builder.build()?)
+    }
 
     #[test]
     fn skips_unseen_events() -> Result<(), Box<dyn Error>> {
@@ -1235,6 +1353,129 @@ mod test {
 
         backtester.elapse_bt(1)?;
         assert_eq!(3, backtester.cur_ts);
+
+        Ok(())
+    }
+
+    #[test]
+    fn drain_market_feed_updates_returns_feed_assets_and_clears() -> Result<(), Box<dyn Error>> {
+        let mut backtester = build_l2_backtest(vec![
+            vec![event(LOCAL_BID_DEPTH_EVENT, 0, 100.0, 1.0)],
+            vec![event(LOCAL_BID_DEPTH_EVENT, 5, 200.0, 1.0)],
+        ])?;
+
+        backtester.elapse(0)?;
+
+        let mut updates = Vec::new();
+        backtester.drain_market_feed_updates(&mut updates);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].asset_no, 0);
+        assert_eq!(updates[0].local_ts, 0);
+        assert_eq!(updates[0].best_bid, 100.0);
+
+        updates.clear();
+        backtester.drain_market_feed_updates(&mut updates);
+        assert!(updates.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn drain_market_feed_updates_coalesces_same_asset() -> Result<(), Box<dyn Error>> {
+        let mut backtester = build_l2_backtest(vec![vec![
+            event(LOCAL_BID_DEPTH_EVENT, 0, 100.0, 1.0),
+            event(LOCAL_ASK_DEPTH_EVENT, 1, 101.0, 2.0),
+        ]])?;
+
+        backtester.elapse(1)?;
+
+        let mut updates = Vec::new();
+        backtester.drain_market_feed_updates(&mut updates);
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].asset_no, 0);
+        assert_eq!(updates[0].local_ts, 1);
+        assert!(updates[0].bbo_changed);
+        assert_eq!(updates[0].best_bid, 100.0);
+        assert_eq!(updates[0].best_ask, 101.0);
+        assert_eq!(updates[0].best_ask_qty, 2.0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn drain_market_feed_updates_marks_trade_only_feed() -> Result<(), Box<dyn Error>> {
+        let mut backtester = build_l2_backtest(vec![vec![
+            event(LOCAL_BID_DEPTH_EVENT, 0, 100.0, 1.0),
+            event(LOCAL_ASK_DEPTH_EVENT, 0, 101.0, 2.0),
+            event(LOCAL_BUY_TRADE_EVENT, 1, 100.0, 3.0),
+        ]])?;
+
+        backtester.elapse(0)?;
+        let mut updates = Vec::new();
+        backtester.drain_market_feed_updates(&mut updates);
+        updates.clear();
+
+        backtester.elapse(1)?;
+        backtester.drain_market_feed_updates(&mut updates);
+
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].trade_seen);
+        assert!(!updates[0].bbo_changed);
+        assert_eq!(updates[0].local_ts, 1);
+        assert_eq!(updates[0].best_bid, 100.0);
+        assert_eq!(updates[0].best_ask, 101.0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn drain_market_feed_updates_records_non_top_depth() -> Result<(), Box<dyn Error>> {
+        let mut backtester = build_l2_backtest(vec![vec![
+            event(LOCAL_BID_DEPTH_EVENT, 0, 100.0, 1.0),
+            event(LOCAL_ASK_DEPTH_EVENT, 0, 101.0, 2.0),
+            event(LOCAL_BID_DEPTH_EVENT, 1, 99.0, 5.0),
+        ]])?;
+
+        backtester.elapse(0)?;
+        let mut updates = Vec::new();
+        backtester.drain_market_feed_updates(&mut updates);
+        updates.clear();
+
+        backtester.elapse(1)?;
+        backtester.drain_market_feed_updates(&mut updates);
+
+        assert_eq!(updates.len(), 1);
+        assert!(!updates[0].trade_seen);
+        assert!(!updates[0].bbo_changed);
+        assert_eq!(updates[0].local_ts, 1);
+        assert_eq!(updates[0].best_bid, 100.0);
+        assert_eq!(updates[0].best_bid_qty, 1.0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn drain_market_feed_updates_marks_bbo_change() -> Result<(), Box<dyn Error>> {
+        let mut backtester = build_l2_backtest(vec![vec![
+            event(LOCAL_BID_DEPTH_EVENT, 0, 100.0, 1.0),
+            event(LOCAL_ASK_DEPTH_EVENT, 0, 101.0, 2.0),
+            event(LOCAL_BID_DEPTH_EVENT, 1, 100.0, 3.0),
+        ]])?;
+
+        backtester.elapse(0)?;
+        let mut updates = Vec::new();
+        backtester.drain_market_feed_updates(&mut updates);
+        updates.clear();
+
+        backtester.elapse(1)?;
+        backtester.drain_market_feed_updates(&mut updates);
+
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].bbo_changed);
+        assert_eq!(updates[0].best_bid, 100.0);
+        assert_eq!(updates[0].best_bid_qty, 3.0);
 
         Ok(())
     }
