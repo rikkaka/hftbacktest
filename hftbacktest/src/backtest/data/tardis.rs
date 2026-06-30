@@ -85,6 +85,11 @@ pub struct TardisCsvConfig {
 }
 
 impl TardisCsvConfig {
+    /// Creates a Tardis CSV stream configuration.
+    ///
+    /// `trades`, `depth`, and `book_ticker` may point to plain `.csv`, gzip-compressed `.csv.gz`,
+    /// or zstd-compressed `.csv.zst` files. `tick_size` and `lot_size` are used by the fused depth
+    /// book when converting raw Tardis rows into backtest events.
     pub fn new(
         trades: impl Into<PathBuf>,
         depth: impl Into<PathBuf>,
@@ -103,10 +108,14 @@ impl TardisCsvConfig {
         }
     }
 
+    /// Sets the maximum number of events returned in one streamed chunk.
+    ///
+    /// A `chunk_size` of `0` is rejected when the stream is first read.
     pub fn chunk_size(self, chunk_size: usize) -> Self {
         Self { chunk_size, ..self }
     }
 
+    /// Sets how depth snapshot rows are emitted into the event stream.
     pub fn snapshot_mode(self, snapshot_mode: TardisSnapshotMode) -> Self {
         Self {
             snapshot_mode,
@@ -115,6 +124,7 @@ impl TardisCsvConfig {
     }
 }
 
+/// Streams fused level-2 events from Tardis CSV files.
 pub struct TardisCsvStream {
     config: TardisCsvConfig,
     inner: Option<TardisCsvStreamInner>,
@@ -124,6 +134,7 @@ pub struct TardisCsvStream {
 }
 
 impl TardisCsvStream {
+    /// Creates a stream from a Tardis CSV configuration.
     pub fn new(config: TardisCsvConfig) -> Self {
         Self {
             config,

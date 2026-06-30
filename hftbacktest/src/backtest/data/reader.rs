@@ -36,6 +36,9 @@ pub struct StreamPrefetchLimiter {
 }
 
 impl StreamPrefetchLimiter {
+    /// Creates a limiter that allows at most `max` stream prefetch tasks to run concurrently.
+    ///
+    /// A value of `0` disables stream prefetching.
     pub fn new(max: usize) -> Self {
         Self {
             max,
@@ -43,6 +46,10 @@ impl StreamPrefetchLimiter {
         }
     }
 
+    /// Tries to reserve one prefetch slot without blocking.
+    ///
+    /// Returns a [`StreamPrefetchPermit`] when a slot is available. The slot is released when the
+    /// permit is dropped.
     pub fn try_acquire(self: &Arc<Self>) -> Option<StreamPrefetchPermit> {
         if self.max == 0 {
             return None;
@@ -75,6 +82,9 @@ impl StreamPrefetchLimiter {
     }
 }
 
+/// A held stream prefetch slot.
+///
+/// Dropping this permit releases the slot back to the associated [`StreamPrefetchLimiter`].
 pub struct StreamPrefetchPermit {
     limiter: Arc<StreamPrefetchLimiter>,
 }
@@ -90,10 +100,19 @@ pub trait DataStream<D>: Debug
 where
     D: POD + Clone,
 {
+    /// Returns the next chunk of data, or `None` when the stream is exhausted.
     fn next_data(&mut self) -> Result<Option<Data<D>>, IoError>;
 
+    /// Sets the optional shared limiter used by [`DataStream::prefetch_next`].
+    ///
+    /// Stream implementations that do not support prefetching can keep the default no-op
+    /// implementation.
     fn set_prefetch_limiter(&mut self, _limiter: Option<Arc<StreamPrefetchLimiter>>) {}
 
+    /// Starts producing the next chunk in the background if supported and capacity is available.
+    ///
+    /// This method must not block the caller. Stream implementations that do not support
+    /// prefetching can keep the default no-op implementation.
     fn prefetch_next(&mut self) {}
 }
 
