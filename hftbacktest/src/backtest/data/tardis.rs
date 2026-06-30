@@ -213,8 +213,8 @@ impl DataStream<Event> for TardisCsvStream {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let result = inner.next_events();
-            let _ = tx.send(TardisPrefetchResult { inner, result });
             drop(permit);
+            let _ = tx.send(TardisPrefetchResult { inner, result });
         });
         self.prefetch_rx = Some(rx);
     }
