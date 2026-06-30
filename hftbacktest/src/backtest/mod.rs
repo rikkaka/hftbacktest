@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     io::Error as IoError,
     ops::{Deref, DerefMut},
+    sync::Arc,
 };
 
 pub use data::DataSource;
@@ -16,7 +17,7 @@ pub use crate::backtest::{
 use crate::{
     backtest::{
         assettype::AssetType,
-        data::{Data, FeedLatencyAdjustment, NpyDTyped},
+        data::{Data, FeedLatencyAdjustment, NpyDTyped, StreamPrefetchLimiter},
         evs::{EventIntentKind, EventSet},
         models::{LatencyModel, QueueModel},
         order::order_bus,
@@ -567,9 +568,21 @@ where
 pub struct BacktestBuilder<MD> {
     local: Vec<BacktestProcessorState<Box<dyn LocalProcessor<MD>>>>,
     exch: Vec<BacktestProcessorState<Box<dyn Processor>>>,
+    stream_prefetch_threads: usize,
 }
 
 impl<MD> BacktestBuilder<MD> {
+    /// Sets the maximum number of stream chunks that can be prefetched concurrently.
+    ///
+    /// The default value is `0`, which disables stream prefetching. Stream prefetching is also
+    /// gated by each asset reader's `parallel_load` setting.
+    pub fn stream_prefetch_threads(self, stream_prefetch_threads: usize) -> Self {
+        Self {
+            stream_prefetch_threads,
+            ..self
+        }
+    }
+
     /// Adds [`Asset`], which will undergo simulation within the backtester.
     pub fn add_asset(self, asset: Asset<dyn LocalProcessor<MD>, dyn Processor, Event>) -> Self {
         let mut self_ = Self { ..self };
@@ -586,15 +599,28 @@ impl<MD> BacktestBuilder<MD> {
 
     /// Builds [`Backtest`].
     pub fn build(self) -> Result<Backtest<MD>, BuildError> {
-        let num_assets = self.local.len();
-        if self.local.len() != num_assets || self.exch.len() != num_assets {
+        let mut local = self.local;
+        let mut exch = self.exch;
+        let num_assets = local.len();
+        if local.len() != num_assets || exch.len() != num_assets {
             panic!();
+        }
+        if self.stream_prefetch_threads > 0 {
+            let limiter = Some(Arc::new(StreamPrefetchLimiter::new(
+                self.stream_prefetch_threads,
+            )));
+            for state in local.iter_mut() {
+                state.reader.set_stream_prefetch_limiter(limiter.clone());
+            }
+            for state in exch.iter_mut() {
+                state.reader.set_stream_prefetch_limiter(limiter.clone());
+            }
         }
         Ok(Backtest {
             cur_ts: i64::MAX,
             evs: EventSet::new(num_assets),
-            local: self.local,
-            exch: self.exch,
+            local,
+            exch,
             market_feed_updates: Vec::with_capacity(num_assets),
             market_feed_update_pos: vec![None; num_assets],
         })
@@ -697,6 +723,7 @@ where
         BacktestBuilder {
             local: vec![],
             exch: vec![],
+            stream_prefetch_threads: 0,
         }
     }
 
@@ -1229,7 +1256,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::{error::Error, io::Error as IoError};
+    use std::{cell::Cell, error::Error, io::Error as IoError, rc::Rc, sync::Arc};
 
     use crate::{
         backtest::{
@@ -1238,7 +1265,7 @@ mod test {
             ExchangeKind::NoPartialFillExchange,
             L2AssetBuilder,
             assettype::LinearAsset,
-            data::{Data, DataStream, Reader},
+            data::{Data, DataStream, Reader, StreamPrefetchLimiter},
             models::{
                 CommonFees,
                 ConstantLatency,
@@ -1307,6 +1334,51 @@ mod test {
         }
     }
 
+    #[derive(Debug)]
+    struct PrefetchCountingStream {
+        chunks: Vec<Vec<Event>>,
+        pos: usize,
+        calls: Rc<Cell<usize>>,
+        limiter: Option<Arc<StreamPrefetchLimiter>>,
+    }
+
+    impl PrefetchCountingStream {
+        fn new(chunks: Vec<Vec<Event>>, calls: Rc<Cell<usize>>) -> Self {
+            Self {
+                chunks,
+                pos: 0,
+                calls,
+                limiter: None,
+            }
+        }
+    }
+
+    impl DataStream<Event> for PrefetchCountingStream {
+        fn next_data(&mut self) -> Result<Option<Data<Event>>, IoError> {
+            if self.pos >= self.chunks.len() {
+                return Ok(None);
+            }
+            let data = Data::from_data(&self.chunks[self.pos]);
+            self.pos += 1;
+            Ok(Some(data))
+        }
+
+        fn set_prefetch_limiter(&mut self, limiter: Option<Arc<StreamPrefetchLimiter>>) {
+            self.limiter = limiter;
+        }
+
+        fn prefetch_next(&mut self) {
+            if self
+                .limiter
+                .as_ref()
+                .and_then(|limiter| limiter.try_acquire())
+                .is_some()
+            {
+                self.calls.set(self.calls.get() + 1);
+            }
+        }
+    }
+
     fn build_l2_backtest(
         data: Vec<Vec<Event>>,
     ) -> Result<Backtest<HashMapMarketDepth>, Box<dyn Error>> {
@@ -1325,6 +1397,31 @@ mod test {
             );
         }
         Ok(builder.build()?)
+    }
+
+    fn build_stream_backtest<Stream>(
+        stream: Stream,
+        parallel_load: bool,
+        stream_prefetch_threads: usize,
+    ) -> Result<Backtest<HashMapMarketDepth>, Box<dyn Error>>
+    where
+        Stream: DataStream<Event> + 'static,
+    {
+        Ok(Backtest::builder()
+            .stream_prefetch_threads(stream_prefetch_threads)
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::stream(stream)])
+                    .parallel_load(parallel_load)
+                    .latency_model(ConstantLatency::new(0, 0))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+                    .exchange(NoPartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?,
+            )
+            .build()?)
     }
 
     #[test]
@@ -1349,6 +1446,34 @@ mod test {
             .build()?;
 
         backtester.goto_end()?;
+        Ok(())
+    }
+
+    #[test]
+    fn stream_prefetch_requires_threads_and_parallel_load() -> Result<(), Box<dyn Error>> {
+        let chunks = vec![
+            vec![event_with_timestamps(LOCAL_EVENT | EXCH_EVENT, 100, 0)],
+            vec![event_with_timestamps(LOCAL_EVENT | EXCH_EVENT, 101, 1)],
+        ];
+
+        let calls = Rc::new(Cell::new(0));
+        let stream = PrefetchCountingStream::new(chunks.clone(), calls.clone());
+        let mut backtester = build_stream_backtest(stream, true, 1)?;
+        backtester.goto_end()?;
+        assert!(calls.get() > 0);
+
+        let calls = Rc::new(Cell::new(0));
+        let stream = PrefetchCountingStream::new(chunks.clone(), calls.clone());
+        let mut backtester = build_stream_backtest(stream, true, 0)?;
+        backtester.goto_end()?;
+        assert_eq!(calls.get(), 0);
+
+        let calls = Rc::new(Cell::new(0));
+        let stream = PrefetchCountingStream::new(chunks, calls.clone());
+        let mut backtester = build_stream_backtest(stream, false, 1)?;
+        backtester.goto_end()?;
+        assert_eq!(calls.get(), 0);
+
         Ok(())
     }
 

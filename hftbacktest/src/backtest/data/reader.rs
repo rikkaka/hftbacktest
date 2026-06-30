@@ -6,6 +6,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{Receiver, Sender, channel},
     },
     thread,
@@ -27,12 +28,73 @@ use crate::{
     types::Event,
 };
 
+/// Limits how many stream prefetch tasks can run concurrently.
+#[derive(Debug)]
+pub struct StreamPrefetchLimiter {
+    max: usize,
+    active: AtomicUsize,
+}
+
+impl StreamPrefetchLimiter {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn try_acquire(self: &Arc<Self>) -> Option<StreamPrefetchPermit> {
+        if self.max == 0 {
+            return None;
+        }
+
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active >= self.max {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(StreamPrefetchPermit {
+                        limiter: self.clone(),
+                    });
+                }
+                Err(value) => active = value,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+pub struct StreamPrefetchPermit {
+    limiter: Arc<StreamPrefetchLimiter>,
+}
+
+impl Drop for StreamPrefetchPermit {
+    fn drop(&mut self) {
+        self.limiter.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Streams chunks of data to the [`Reader`].
 pub trait DataStream<D>: Debug
 where
     D: POD + Clone,
 {
     fn next_data(&mut self) -> Result<Option<Data<D>>, IoError>;
+
+    fn set_prefetch_limiter(&mut self, _limiter: Option<Arc<StreamPrefetchLimiter>>) {}
+
+    fn prefetch_next(&mut self) {}
 }
 
 struct StreamState<D>
@@ -88,6 +150,14 @@ where
                 Ok(None)
             }
         }
+    }
+
+    fn set_prefetch_limiter(&self, limiter: Option<Arc<StreamPrefetchLimiter>>) {
+        self.state.borrow_mut().stream.set_prefetch_limiter(limiter);
+    }
+
+    fn prefetch_next(&self) {
+        self.state.borrow_mut().stream.prefetch_next();
     }
 }
 
@@ -486,6 +556,15 @@ where
         self.data_consumers = data_consumers.max(1);
     }
 
+    pub(crate) fn set_stream_prefetch_limiter(
+        &mut self,
+        limiter: Option<Arc<StreamPrefetchLimiter>>,
+    ) {
+        for stream in self.streams.values() {
+            stream.set_prefetch_limiter(limiter.clone());
+        }
+    }
+
     /// Retrieves the next [`Data`] based on the order of your additions.
     pub fn next_data(&mut self) -> Result<Data<D>, BacktestError> {
         loop {
@@ -548,6 +627,9 @@ where
         if self.cache.contains(&chunk_key) {
             let data = self.cache.get(&chunk_key);
             *self.stream_chunks.get_mut(key).unwrap() += 1;
+            if self.parallel_load {
+                self.streams.get(key).unwrap().prefetch_next();
+            }
             return Ok(Some(data));
         }
 
@@ -577,6 +659,9 @@ where
                     .insert_with_min_checkouts(chunk_key.clone(), data, self.data_consumers);
                 let data = self.cache.get(&chunk_key);
                 *self.stream_chunks.get_mut(key).unwrap() += 1;
+                if self.parallel_load {
+                    stream.prefetch_next();
+                }
                 Ok(Some(data))
             }
             None => Ok(None),
@@ -694,5 +779,26 @@ impl DataPreprocess<Event> for FeedLatencyAdjustment {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::StreamPrefetchLimiter;
+
+    #[test]
+    fn stream_prefetch_limiter_caps_active_tasks() {
+        let limiter = Arc::new(StreamPrefetchLimiter::new(1));
+
+        let permit = limiter.try_acquire();
+        assert!(permit.is_some());
+        assert_eq!(limiter.active(), 1);
+        assert!(limiter.try_acquire().is_none());
+
+        drop(permit);
+        assert_eq!(limiter.active(), 0);
+        assert!(limiter.try_acquire().is_some());
     }
 }

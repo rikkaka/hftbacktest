@@ -3,13 +3,18 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, Error as IoError, ErrorKind},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver},
+    },
+    thread,
 };
 
 use flate2::read::GzDecoder;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
 use crate::{
-    backtest::data::{Data, DataStream},
+    backtest::data::{Data, DataStream, StreamPrefetchLimiter},
     depth::FusedHashMapMarketDepth,
     types::{
         BUY_EVENT,
@@ -113,6 +118,8 @@ impl TardisCsvConfig {
 pub struct TardisCsvStream {
     config: TardisCsvConfig,
     inner: Option<TardisCsvStreamInner>,
+    prefetch_limiter: Option<Arc<StreamPrefetchLimiter>>,
+    prefetch_rx: Option<Receiver<TardisPrefetchResult>>,
     finished: bool,
 }
 
@@ -121,18 +128,45 @@ impl TardisCsvStream {
         Self {
             config,
             inner: None,
+            prefetch_limiter: None,
+            prefetch_rx: None,
             finished: false,
         }
     }
 
-    fn inner(&mut self) -> Result<&mut TardisCsvStreamInner, IoError> {
+    fn init_inner(&mut self) -> Result<(), IoError> {
         if self.inner.is_none() {
             if self.config.chunk_size == 0 {
                 return Err(invalid_data("chunk_size must be greater than zero"));
             }
             self.inner = Some(TardisCsvStreamInner::new(self.config.clone())?);
         }
+        Ok(())
+    }
+
+    fn inner(&mut self) -> Result<&mut TardisCsvStreamInner, IoError> {
+        self.init_inner()?;
         Ok(self.inner.as_mut().unwrap())
+    }
+
+    fn take_inner(&mut self) -> Result<TardisCsvStreamInner, IoError> {
+        self.init_inner()?;
+        Ok(self.inner.take().unwrap())
+    }
+
+    fn next_events(&mut self) -> Result<Option<Vec<Event>>, IoError> {
+        if let Some(rx) = self.prefetch_rx.take() {
+            let TardisPrefetchResult { inner, result } = rx.recv().map_err(|err| {
+                IoError::new(
+                    ErrorKind::Other,
+                    format!("Tardis stream prefetch worker failed: {err}"),
+                )
+            })?;
+            self.inner = Some(inner);
+            return result;
+        }
+
+        self.inner()?.next_events()
     }
 }
 
@@ -151,13 +185,44 @@ impl DataStream<Event> for TardisCsvStream {
             return Ok(None);
         }
 
-        let inner = self.inner()?;
-        let data = inner.next_data()?;
-        if data.is_none() {
+        let events = self.next_events()?;
+        if events.is_none() {
             self.finished = true;
         }
-        Ok(data)
+        Ok(events.map(|events| Data::from_data(&events)))
     }
+
+    fn set_prefetch_limiter(&mut self, limiter: Option<Arc<StreamPrefetchLimiter>>) {
+        self.prefetch_limiter = limiter;
+    }
+
+    fn prefetch_next(&mut self) {
+        if self.finished || self.prefetch_rx.is_some() {
+            return;
+        }
+        let Some(limiter) = self.prefetch_limiter.clone() else {
+            return;
+        };
+        let Some(permit) = limiter.try_acquire() else {
+            return;
+        };
+        let Ok(mut inner) = self.take_inner() else {
+            return;
+        };
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = inner.next_events();
+            let _ = tx.send(TardisPrefetchResult { inner, result });
+            drop(permit);
+        });
+        self.prefetch_rx = Some(rx);
+    }
+}
+
+struct TardisPrefetchResult {
+    inner: TardisCsvStreamInner,
+    result: Result<Option<Vec<Event>>, IoError>,
 }
 
 struct TardisCsvStreamInner {
@@ -206,7 +271,7 @@ impl TardisCsvStreamInner {
         })
     }
 
-    fn next_data(&mut self) -> Result<Option<Data<Event>>, IoError> {
+    fn next_events(&mut self) -> Result<Option<Vec<Event>>, IoError> {
         let mut events = Vec::with_capacity(self.config.chunk_size);
         while events.len() < self.config.chunk_size {
             let Some(mut event) = self.next_event()? else {
@@ -220,7 +285,7 @@ impl TardisCsvStreamInner {
         if events.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(Data::from_data(&events)))
+            Ok(Some(events))
         }
     }
 
@@ -509,7 +574,7 @@ struct BookTickerRow {
 
 struct CsvFileReader {
     path: PathBuf,
-    reader: Box<dyn BufRead>,
+    reader: Box<dyn BufRead + Send>,
     line: String,
     row: usize,
 }
@@ -562,7 +627,7 @@ impl CsvFileReader {
     }
 }
 
-fn open_reader(path: &Path) -> Result<Box<dyn BufRead>, IoError> {
+fn open_reader(path: &Path) -> Result<Box<dyn BufRead + Send>, IoError> {
     let file = File::open(path)?;
     let path_str = path.to_string_lossy();
     if path_str.ends_with(".gz") {
@@ -692,7 +757,10 @@ mod tests {
         fs::{create_dir, remove_dir_all, write},
         io::Write,
         path::{Path, PathBuf},
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -702,7 +770,7 @@ mod tests {
     use crate::{
         backtest::{
             BacktestError,
-            data::{DataSource, Reader},
+            data::{DataSource, Reader, StreamPrefetchLimiter},
         },
         types::{DEPTH_EVENT, EXCH_EVENT, LOCAL_EVENT},
     };
@@ -790,6 +858,20 @@ exchange,symbol,timestamp,local_timestamp,ask_amount,ask_price,bid_price,bid_amo
     }
 
     #[test]
+    fn prefetch_stream_matches_sync_output() {
+        let dir = TestDir::new();
+        let trades = dir.write("trades.csv", TRADES);
+        let depth = dir.write("depth.csv", DEPTH);
+        let book_ticker = dir.write("book_ticker.csv", BOOK_TICKER);
+        let config = TardisCsvConfig::new(trades, depth, book_ticker, 1.0, 1.0).chunk_size(2);
+
+        let sync_events = collect_events(config.clone()).unwrap();
+        let prefetch_events = collect_events_with_stream_prefetch(config, 1).unwrap();
+
+        assert_eq!(prefetch_events, sync_events);
+    }
+
+    #[test]
     fn flushes_snapshot_at_depth_eof() {
         let dir = TestDir::new();
         let trades = dir.write("trades.csv", EMPTY_TRADES);
@@ -856,10 +938,23 @@ binance-futures,BTCUSDT,1000,1000,2,sell,101.0,0.2
     }
 
     fn collect_events(config: TardisCsvConfig) -> Result<Vec<Event>, BacktestError> {
+        collect_events_with_stream_prefetch(config, 0)
+    }
+
+    fn collect_events_with_stream_prefetch(
+        config: TardisCsvConfig,
+        stream_prefetch_threads: usize,
+    ) -> Result<Vec<Event>, BacktestError> {
         let mut reader = Reader::builder()
+            .parallel_load(stream_prefetch_threads > 0)
             .data(vec![DataSource::tardis_csv(config)])
             .build()
             .unwrap();
+        if stream_prefetch_threads > 0 {
+            reader.set_stream_prefetch_limiter(Some(Arc::new(StreamPrefetchLimiter::new(
+                stream_prefetch_threads,
+            ))));
+        }
         let mut events = Vec::new();
 
         loop {

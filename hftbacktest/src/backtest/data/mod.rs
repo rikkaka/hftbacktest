@@ -22,6 +22,7 @@ pub use reader::{
     Reader,
     ReaderBuilder,
     StreamDataSource,
+    StreamPrefetchLimiter,
 };
 #[cfg(feature = "tardis")]
 pub use tardis::{TardisCsvConfig, TardisSnapshotMode};
