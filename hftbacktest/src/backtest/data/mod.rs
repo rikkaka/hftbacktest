@@ -1,5 +1,7 @@
 mod npy;
 mod reader;
+#[cfg(feature = "tardis")]
+mod tardis;
 
 use std::{
     marker::PhantomData,
@@ -11,7 +13,18 @@ use std::{
 };
 
 pub use npy::{Field, NpyDTyped, NpyHeader, read_npy_file, read_npz_file, write_npy};
-pub use reader::{Cache, DataPreprocess, DataSource, FeedLatencyAdjustment, Reader, ReaderBuilder};
+pub use reader::{
+    Cache,
+    DataPreprocess,
+    DataSource,
+    DataStream,
+    FeedLatencyAdjustment,
+    Reader,
+    ReaderBuilder,
+    StreamDataSource,
+};
+#[cfg(feature = "tardis")]
+pub use tardis::{TardisCsvConfig, TardisSnapshotMode};
 
 use crate::utils::{AlignedArray, CACHE_LINE_SIZE};
 

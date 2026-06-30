@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
+    fmt::{Debug, Formatter},
     io::{Error as IoError, ErrorKind},
     rc::Rc,
     sync::{
@@ -12,6 +13,8 @@ use std::{
 
 use uuid::Uuid;
 
+#[cfg(feature = "tardis")]
+use super::tardis::{TardisCsvConfig, TardisCsvStream};
 use crate::{
     backtest::{
         BacktestError,
@@ -23,6 +26,79 @@ use crate::{
     },
     types::Event,
 };
+
+/// Streams chunks of data to the [`Reader`].
+pub trait DataStream<D>: Debug
+where
+    D: POD + Clone,
+{
+    fn next_data(&mut self) -> Result<Option<Data<D>>, IoError>;
+}
+
+struct StreamState<D>
+where
+    D: POD + Clone,
+{
+    stream: Box<dyn DataStream<D>>,
+    next_chunk: usize,
+    end_chunk: Option<usize>,
+}
+
+/// Shared stream data source.
+#[derive(Clone)]
+pub struct StreamDataSource<D>
+where
+    D: POD + Clone,
+{
+    state: Rc<RefCell<StreamState<D>>>,
+}
+
+impl<D> StreamDataSource<D>
+where
+    D: POD + Clone,
+{
+    pub(crate) fn new(stream: Box<dyn DataStream<D>>) -> Self {
+        Self {
+            state: Rc::new(RefCell::new(StreamState {
+                stream,
+                next_chunk: 0,
+                end_chunk: None,
+            })),
+        }
+    }
+
+    fn next_chunk(&self) -> usize {
+        self.state.borrow().next_chunk
+    }
+
+    fn end_chunk(&self) -> Option<usize> {
+        self.state.borrow().end_chunk
+    }
+
+    fn read_next_chunk(&self) -> Result<Option<(usize, Data<D>)>, IoError> {
+        let mut state = self.state.borrow_mut();
+        let chunk = state.next_chunk;
+        match state.stream.next_data()? {
+            Some(data) => {
+                state.next_chunk += 1;
+                Ok(Some((chunk, data)))
+            }
+            None => {
+                state.end_chunk = Some(chunk);
+                Ok(None)
+            }
+        }
+    }
+}
+
+impl<D> Debug for StreamDataSource<D>
+where
+    D: POD + Clone,
+{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamDataSource").finish_non_exhaustive()
+    }
+}
 
 /// Data source for the [`Reader`].
 #[derive(Clone, Debug)]
@@ -37,6 +113,29 @@ where
     File(String),
     /// Data is loaded and set by the user.
     Data(Data<D>),
+    /// Data is streamed in chunks.
+    Stream(StreamDataSource<D>),
+}
+
+impl<D> DataSource<D>
+where
+    D: POD + Clone,
+{
+    /// Streams data in chunks.
+    pub fn stream<Stream>(stream: Stream) -> Self
+    where
+        Stream: DataStream<D> + 'static,
+    {
+        Self::Stream(StreamDataSource::new(Box::new(stream)))
+    }
+}
+
+#[cfg(feature = "tardis")]
+impl DataSource<Event> {
+    /// Streams Tardis CSV data in the fused level-2 format.
+    pub fn tardis_csv(config: TardisCsvConfig) -> Self {
+        Self::stream(TardisCsvStream::new(config))
+    }
 }
 
 #[derive(Debug)]
@@ -45,6 +144,8 @@ where
     D: POD + Clone,
 {
     count: usize,
+    checkout_count: usize,
+    min_checkouts: usize,
     ready: bool,
     data: Data<D>,
 }
@@ -56,6 +157,18 @@ where
     pub fn new(data: Data<D>) -> Self {
         Self {
             count: 0,
+            checkout_count: 0,
+            min_checkouts: 0,
+            ready: true,
+            data,
+        }
+    }
+
+    pub fn new_with_min_checkouts(data: Data<D>, min_checkouts: usize) -> Self {
+        Self {
+            count: 0,
+            checkout_count: 0,
+            min_checkouts,
             ready: true,
             data,
         }
@@ -64,6 +177,8 @@ where
     pub fn empty() -> Self {
         Self {
             count: 0,
+            checkout_count: 0,
+            min_checkouts: 0,
             ready: false,
             data: Data::empty(),
         }
@@ -75,12 +190,13 @@ where
 
     pub fn checkout(&mut self) -> Data<D> {
         self.count += 1;
+        self.checkout_count += 1;
         self.data.clone()
     }
 
     pub fn turn_in(&mut self) -> bool {
         self.count -= 1;
-        self.count == 0
+        self.count == 0 && self.checkout_count >= self.min_checkouts
     }
 }
 
@@ -103,6 +219,14 @@ where
     /// Inserts a key-value pair into the `Cache`.
     pub fn insert(&mut self, key: String, data: Data<D>) {
         self.0.borrow_mut().insert(key, CachedData::new(data));
+    }
+
+    /// Inserts a key-value pair that must be checked out at least `min_checkouts` times before it
+    /// can be removed.
+    pub fn insert_with_min_checkouts(&mut self, key: String, data: Data<D>, min_checkouts: usize) {
+        self.0
+            .borrow_mut()
+            .insert(key, CachedData::new_with_min_checkouts(data, min_checkouts));
     }
 
     /// Prepares cached data by inserting a key-value pair with empty data into the `Cache`.
@@ -214,6 +338,7 @@ where
     data_key_list: Vec<String>,
     cache: Cache<D>,
     temporary_data: HashMap<String, Data<D>>,
+    temporary_streams: HashMap<String, StreamDataSource<D>>,
     parallel_load: bool,
     preprocessor: Option<Arc<Box<dyn DataPreprocess<D> + Sync + Send + 'static>>>,
 }
@@ -227,6 +352,7 @@ where
             data_key_list: Default::default(),
             cache: Default::default(),
             temporary_data: Default::default(),
+            temporary_streams: Default::default(),
             parallel_load: false,
             preprocessor: None,
         }
@@ -271,6 +397,7 @@ where
     pub fn data(self, data: Vec<DataSource<D>>) -> Self {
         let mut data_key_list = self.data_key_list;
         let mut temporary_data = self.temporary_data;
+        let mut temporary_streams = self.temporary_streams;
         for item in data {
             match item {
                 DataSource::File(filepath) => {
@@ -281,11 +408,17 @@ where
                     data_key_list.push(key.clone());
                     temporary_data.insert(key, data);
                 }
+                DataSource::Stream(stream) => {
+                    let key = Uuid::new_v4().to_string();
+                    data_key_list.push(key.clone());
+                    temporary_streams.insert(key, stream);
+                }
             }
         }
         Self {
             data_key_list,
             temporary_data,
+            temporary_streams,
             ..self
         }
     }
@@ -304,11 +437,14 @@ where
         Ok(Reader {
             data_key_list: self.data_key_list.clone(),
             cache,
+            streams: self.temporary_streams,
+            stream_chunks: Default::default(),
             data_num: 0,
             tx,
             rx: Rc::new(rx),
             parallel_load: self.parallel_load,
             preprocessor: self.preprocessor.clone(),
+            data_consumers: 1,
         })
     }
 }
@@ -321,11 +457,14 @@ where
 {
     data_key_list: Vec<String>,
     cache: Cache<D>,
+    streams: HashMap<String, StreamDataSource<D>>,
+    stream_chunks: HashMap<String, usize>,
     data_num: usize,
     tx: Sender<LoadDataResult<D>>,
     rx: Rc<Receiver<LoadDataResult<D>>>,
     parallel_load: bool,
     preprocessor: Option<Arc<Box<dyn DataPreprocess<D> + Sync + Send + 'static>>>,
+    data_consumers: usize,
 }
 
 impl<D> Reader<D>
@@ -343,16 +482,37 @@ where
         self.cache.remove(data);
     }
 
+    pub(crate) fn set_data_consumers(&mut self, data_consumers: usize) {
+        self.data_consumers = data_consumers.max(1);
+    }
+
     /// Retrieves the next [`Data`] based on the order of your additions.
     pub fn next_data(&mut self) -> Result<Data<D>, BacktestError> {
-        if self.data_num < self.data_key_list.len() {
+        loop {
+            if self.data_num >= self.data_key_list.len() {
+                return Err(BacktestError::EndOfData);
+            }
+
             let key = self.data_key_list.get(self.data_num).cloned().unwrap();
+
+            if self.streams.contains_key(&key) {
+                match self.next_stream_data(&key)? {
+                    Some(data) => return Ok(data),
+                    None => {
+                        self.data_num += 1;
+                        continue;
+                    }
+                }
+            }
+
             self.load_data(&key)?;
 
             if self.parallel_load {
                 let next_key = self.data_key_list.get(self.data_num + 1).cloned();
                 if let Some(next_key) = next_key {
-                    self.load_data(&next_key)?;
+                    if !self.streams.contains_key(&next_key) {
+                        self.load_data(&next_key)?;
+                    }
                 }
             }
 
@@ -377,9 +537,49 @@ where
 
             let data = self.cache.get(&key);
             self.data_num += 1;
-            Ok(data)
-        } else {
-            Err(BacktestError::EndOfData)
+            return Ok(data);
+        }
+    }
+
+    fn next_stream_data(&mut self, key: &str) -> Result<Option<Data<D>>, BacktestError> {
+        let chunk = *self.stream_chunks.entry(key.to_string()).or_insert(0);
+        let chunk_key = stream_chunk_key(key, chunk);
+
+        if self.cache.contains(&chunk_key) {
+            let data = self.cache.get(&chunk_key);
+            *self.stream_chunks.get_mut(key).unwrap() += 1;
+            return Ok(Some(data));
+        }
+
+        let stream = self.streams.get(key).cloned().unwrap();
+        if stream.end_chunk().is_some_and(|end| chunk >= end) {
+            return Ok(None);
+        }
+        if stream.next_chunk() != chunk {
+            return Err(BacktestError::DataError(IoError::new(
+                ErrorKind::InvalidData,
+                "stream chunk was released before all readers consumed it",
+            )));
+        }
+
+        match stream.read_next_chunk()? {
+            Some((read_chunk, mut data)) => {
+                if read_chunk != chunk {
+                    return Err(BacktestError::DataError(IoError::new(
+                        ErrorKind::InvalidData,
+                        "stream returned an unexpected chunk",
+                    )));
+                }
+                if let Some(preprocessor) = &self.preprocessor {
+                    preprocessor.preprocess(&mut data)?;
+                }
+                self.cache
+                    .insert_with_min_checkouts(chunk_key.clone(), data, self.data_consumers);
+                let data = self.cache.get(&chunk_key);
+                *self.stream_chunks.get_mut(key).unwrap() += 1;
+                Ok(Some(data))
+            }
+            None => Ok(None),
         }
     }
 
@@ -444,6 +644,10 @@ where
         }
         Ok(())
     }
+}
+
+fn stream_chunk_key(key: &str, chunk: usize) -> String {
+    format!("{key}#{chunk}")
 }
 
 /// `DataPreprocess` offers a function to preprocess data before it is fed into the backtesting.

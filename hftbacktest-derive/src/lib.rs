@@ -289,6 +289,9 @@ pub fn build_asset(input: TokenStream) -> TokenStream {
                                 Some(DataSource::Data(data)) => {
                                     market_depth.apply_snapshot(data);
                                 }
+                                Some(DataSource::Stream(_)) => {
+                                    panic!("stream data source cannot be used as initial snapshot");
+                                }
                                 None => {}
                             }
 
@@ -307,6 +310,9 @@ pub fn build_asset(input: TokenStream) -> TokenStream {
                                 }
                                 Some(DataSource::Data(data)) => {
                                     market_depth.apply_snapshot(data);
+                                }
+                                Some(DataSource::Stream(_)) => {
+                                    panic!("stream data source cannot be used as initial snapshot");
                                 }
                                 None => {}
                             }

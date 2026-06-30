@@ -573,13 +573,14 @@ impl<MD> BacktestBuilder<MD> {
     /// Adds [`Asset`], which will undergo simulation within the backtester.
     pub fn add_asset(self, asset: Asset<dyn LocalProcessor<MD>, dyn Processor, Event>) -> Self {
         let mut self_ = Self { ..self };
-        self_.local.push(BacktestProcessorState::new(
-            asset.local,
-            asset.reader.clone(),
-        ));
+        let mut reader = asset.reader;
+        reader.set_data_consumers(2);
+        self_
+            .local
+            .push(BacktestProcessorState::new(asset.local, reader.clone()));
         self_
             .exch
-            .push(BacktestProcessorState::new(asset.exch, asset.reader));
+            .push(BacktestProcessorState::new(asset.exch, reader));
         self_
     }
 
@@ -708,6 +709,14 @@ where
         if local.len() != num_assets || exch.len() != num_assets || reader.len() != num_assets {
             panic!();
         }
+
+        let reader = reader
+            .into_iter()
+            .map(|mut reader| {
+                reader.set_data_consumers(2);
+                reader
+            })
+            .collect::<Vec<_>>();
 
         let local = local
             .into_iter()
@@ -1220,7 +1229,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::error::Error;
+    use std::{error::Error, io::Error as IoError};
 
     use crate::{
         backtest::{
@@ -1229,7 +1238,7 @@ mod test {
             ExchangeKind::NoPartialFillExchange,
             L2AssetBuilder,
             assettype::LinearAsset,
-            data::Data,
+            data::{Data, DataStream, Reader},
             models::{
                 CommonFees,
                 ConstantLatency,
@@ -1262,6 +1271,42 @@ mod test {
         }
     }
 
+    fn event_with_timestamps(ev: u64, exch_ts: i64, local_ts: i64) -> Event {
+        Event {
+            ev,
+            exch_ts,
+            local_ts,
+            px: 0.0,
+            qty: 0.0,
+            order_id: 0,
+            ival: 0,
+            fval: 0.0,
+        }
+    }
+
+    #[derive(Debug)]
+    struct ChunkStream {
+        chunks: Vec<Vec<Event>>,
+        pos: usize,
+    }
+
+    impl ChunkStream {
+        fn new(chunks: Vec<Vec<Event>>) -> Self {
+            Self { chunks, pos: 0 }
+        }
+    }
+
+    impl DataStream<Event> for ChunkStream {
+        fn next_data(&mut self) -> Result<Option<Data<Event>>, IoError> {
+            if self.pos >= self.chunks.len() {
+                return Ok(None);
+            }
+            let data = Data::from_data(&self.chunks[self.pos]);
+            self.pos += 1;
+            Ok(Some(data))
+        }
+    }
+
     fn build_l2_backtest(
         data: Vec<Vec<Event>>,
     ) -> Result<Backtest<HashMapMarketDepth>, Box<dyn Error>> {
@@ -1280,6 +1325,55 @@ mod test {
             );
         }
         Ok(builder.build()?)
+    }
+
+    #[test]
+    fn builder_stream_chunks_wait_for_both_sides() -> Result<(), Box<dyn Error>> {
+        let stream = ChunkStream::new(vec![
+            vec![event_with_timestamps(LOCAL_EVENT | EXCH_EVENT, 100, 0)],
+            vec![event_with_timestamps(LOCAL_EVENT | EXCH_EVENT, 101, 1)],
+        ]);
+
+        let mut backtester = Backtest::builder()
+            .add_asset(
+                L2AssetBuilder::default()
+                    .data(vec![DataSource::stream(stream)])
+                    .latency_model(ConstantLatency::new(0, 0))
+                    .asset_type(LinearAsset::new(1.0))
+                    .fee_model(TradingValueFeeModel::new(CommonFees::new(0.0, 0.0)))
+                    .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+                    .exchange(NoPartialFillExchange)
+                    .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                    .build()?,
+            )
+            .build()?;
+
+        backtester.goto_end()?;
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_load_skips_stream_data_source() -> Result<(), Box<dyn Error>> {
+        let first = [event_with_timestamps(LOCAL_EVENT, 0, 0)];
+        let stream = ChunkStream::new(vec![vec![event_with_timestamps(LOCAL_EVENT, 1, 1)]]);
+        let mut reader = Reader::builder()
+            .parallel_load(true)
+            .data(vec![
+                DataSource::Data(Data::from_data(&first)),
+                DataSource::stream(stream),
+            ])
+            .build()?;
+
+        let data = reader.next_data()?;
+        assert_eq!(data.len(), 1);
+        reader.release(data);
+
+        let data = reader.next_data()?;
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].local_ts, 1);
+        reader.release(data);
+
+        Ok(())
     }
 
     #[test]
