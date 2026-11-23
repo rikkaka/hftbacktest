@@ -131,6 +131,20 @@ pub enum ExchangeKind {
     PartialFillExchange,
 }
 
+/// Events allowed to trigger executions in [`NoPartialFillExchange`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MatchingMode {
+    /// Match on both order-book updates and trades, including immediate liquidity taking.
+    #[default]
+    BookAndTrade,
+    /// Match only on subsequent opposing-aggressor trades, at the order's limit price.
+    ///
+    /// Book data still initializes queue positions, checks GTX orders and estimates maker/taker
+    /// fees at acceptance. Depth updates do not advance queues or trigger executions.
+    /// Only GTC/GTX limit orders with [`ExchangeKind::NoPartialFillExchange`] are supported.
+    TradeOnly,
+}
+
 /// A level-2 asset builder.
 pub struct L2AssetBuilder<LM, AT, QM, MD, FM> {
     latency_model: Option<LM>,
@@ -140,6 +154,7 @@ pub struct L2AssetBuilder<LM, AT, QM, MD, FM> {
     latency_offset: i64,
     fee_model: Option<FM>,
     exch_kind: ExchangeKind,
+    matching_mode: MatchingMode,
     last_trades_cap: usize,
     queue_model: Option<QM>,
     depth_builder: Option<Box<dyn Fn() -> MD>>,
@@ -163,6 +178,7 @@ where
             latency_offset: 0,
             fee_model: None,
             exch_kind: ExchangeKind::NoPartialFillExchange,
+            matching_mode: MatchingMode::default(),
             last_trades_cap: 0,
             queue_model: None,
             depth_builder: None,
@@ -223,6 +239,14 @@ where
         Self { exch_kind, ..self }
     }
 
+    /// Selects which events can trigger executions. Defaults to [`MatchingMode::BookAndTrade`].
+    pub fn matching_mode(self, matching_mode: MatchingMode) -> Self {
+        Self {
+            matching_mode,
+            ..self
+        }
+    }
+
     /// Sets the initial capacity of the vector storing the last market trades.
     /// The default value is `0`, indicating that no last trades are stored.
     pub fn last_trades_capacity(self, capacity: usize) -> Self {
@@ -253,6 +277,13 @@ where
 
     /// Builds an `Asset`.
     pub fn build(self) -> Result<Asset<dyn LocalProcessor<MD>, dyn Processor, Event>, BuildError> {
+        if self.matching_mode == MatchingMode::TradeOnly
+            && matches!(self.exch_kind, ExchangeKind::PartialFillExchange)
+        {
+            return Err(BuildError::Error(anyhow::anyhow!(
+                "TradeOnly matching requires NoPartialFillExchange"
+            )));
+        }
         let reader = if self.latency_offset == 0 {
             Reader::builder()
                 .parallel_load(self.parallel_load)
@@ -313,7 +344,8 @@ where
                     State::new(asset_type, fee_model),
                     queue_model,
                     order_e2l,
-                );
+                )
+                .matching_mode(self.matching_mode);
 
                 Ok(Asset {
                     local: Box::new(local),
