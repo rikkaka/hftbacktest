@@ -91,7 +91,7 @@ where
 
 struct TradeOnlyOrder {
     active_after: i64,
-    maker: bool,
+    awaiting_reference: bool,
 }
 
 impl<AT, LM, QM, MD, FM> NoPartialFillExchange<AT, LM, QM, MD, FM>
@@ -125,11 +125,11 @@ where
 
     /// Selects the matching mode before processing any orders.
     ///
-    /// In [`MatchingMode::TradeOnly`], GTC/GTX limit orders wait for an opposing-aggressor
-    /// trade strictly after their acceptance (or requeue) timestamp. Fills use the limit price;
-    /// depth changes neither execute orders nor advance queues. A GTC order crossing the book
-    /// at acceptance is charged taker fees when it eventually fills; other accepted orders are
-    /// charged maker fees. This is a fee approximation, not a reconstruction of taker execution.
+    /// In [`MatchingMode::TradeOnly`], the first same-side aggressor trade strictly after
+    /// acceptance (or requeue) supplies an estimated opposite quote. Crossing GTC orders take
+    /// at that trade price; GTX orders expire. Opposing-aggressor trades can fill as maker at
+    /// the limit price, including before the reference arrives. Depth changes neither execute
+    /// orders nor advance queues. Responses use the triggering trade time, never acceptance time.
     pub fn matching_mode(self, matching_mode: MatchingMode) -> Self {
         Self {
             matching_mode,
@@ -137,13 +137,9 @@ where
         }
     }
 
-    fn trade_fill_maker(&self, order_id: OrderId, timestamp: i64) -> Option<bool> {
-        if self.matching_mode == MatchingMode::TradeOnly {
-            let accepted = &self.trade_only_orders[&order_id];
-            (timestamp > accepted.active_after).then_some(accepted.maker)
-        } else {
-            Some(true)
-        }
+    fn trade_is_eligible(&self, order_id: OrderId, timestamp: i64) -> bool {
+        self.matching_mode != MatchingMode::TradeOnly
+            || timestamp > self.trade_only_orders[&order_id].active_after
     }
 
     fn check_if_sell_filled(
@@ -153,21 +149,21 @@ where
         qty: f64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
-        let Some(maker) = self.trade_fill_maker(order.order_id, timestamp) else {
+        if !self.trade_is_eligible(order.order_id, timestamp) {
             return Ok(());
-        };
+        }
         match order.price_tick.cmp(&price_tick) {
             Ordering::Greater => {}
             Ordering::Less => {
                 self.filled_orders.push(order.order_id);
-                return self.fill::<true>(order, timestamp, maker, order.price_tick);
+                return self.fill::<true>(order, timestamp, true, order.price_tick);
             }
             Ordering::Equal => {
                 // Updates the order's queue position.
                 self.queue_model.trade(order, qty, &self.depth);
                 if self.queue_model.is_filled(order, &self.depth) > 0.0 {
                     self.filled_orders.push(order.order_id);
-                    return self.fill::<true>(order, timestamp, maker, order.price_tick);
+                    return self.fill::<true>(order, timestamp, true, order.price_tick);
                 }
             }
         }
@@ -181,13 +177,13 @@ where
         qty: f64,
         timestamp: i64,
     ) -> Result<(), BacktestError> {
-        let Some(maker) = self.trade_fill_maker(order.order_id, timestamp) else {
+        if !self.trade_is_eligible(order.order_id, timestamp) {
             return Ok(());
-        };
+        }
         match order.price_tick.cmp(&price_tick) {
             Ordering::Greater => {
                 self.filled_orders.push(order.order_id);
-                return self.fill::<true>(order, timestamp, maker, order.price_tick);
+                return self.fill::<true>(order, timestamp, true, order.price_tick);
             }
             Ordering::Less => {}
             Ordering::Equal => {
@@ -195,7 +191,7 @@ where
                 self.queue_model.trade(order, qty, &self.depth);
                 if self.queue_model.is_filled(order, &self.depth) > 0.0 {
                     self.filled_orders.push(order.order_id);
-                    return self.fill::<true>(order, timestamp, maker, order.price_tick);
+                    return self.fill::<true>(order, timestamp, true, order.price_tick);
                 }
             }
         }
@@ -489,22 +485,10 @@ where
         {
             return Err(BacktestError::InvalidOrderRequest);
         }
-        let crosses = match order.side {
-            Side::Buy => {
-                self.depth.best_ask_tick() != INVALID_MAX
-                    && order.price_tick >= self.depth.best_ask_tick()
-            }
-            Side::Sell => {
-                self.depth.best_bid_tick() != INVALID_MIN
-                    && order.price_tick <= self.depth.best_bid_tick()
-            }
-            _ => return Err(BacktestError::InvalidOrderRequest),
-        };
-        order.exch_timestamp = timestamp;
-        if crosses && order.time_in_force == TimeInForce::GTX {
-            order.status = Status::Expired;
-            return Ok(());
+        if !matches!(order.side, Side::Buy | Side::Sell) {
+            return Err(BacktestError::InvalidOrderRequest);
         }
+        order.exch_timestamp = timestamp;
         self.queue_model.new_order(order, &self.depth);
         order.leaves_qty = order.qty;
         order.status = Status::New;
@@ -521,7 +505,7 @@ where
             order.order_id,
             TradeOnlyOrder {
                 active_after: timestamp,
-                maker: !crosses,
+                awaiting_reference: true,
             },
         );
         self.orders
@@ -535,20 +519,26 @@ where
         {
             let orders = self.orders.clone();
             let mut orders = orders.borrow_mut();
-            // Select by our own order prices, never by the potentially stale BBO. Process eligible
-            // orders deterministically in price/time/id order; retain the no-partial-fill model.
+            // `side` is the maker side, opposite the aggressor. Also visit every same-side order
+            // awaiting its first reference, even if that reference does not cross its limit.
             let mut eligible: Vec<_> = orders
                 .values()
                 .filter(|order| {
-                    order.side == side
-                        && if side == Side::Buy {
-                            order.price_tick >= price_tick
-                        } else {
-                            order.price_tick <= price_tick
-                        }
+                    let state = &self.trade_only_orders[&order.order_id];
+                    if event.exch_ts <= state.active_after {
+                        return false;
+                    }
+                    if order.side != side {
+                        state.awaiting_reference
+                    } else if side == Side::Buy {
+                        order.price_tick >= price_tick
+                    } else {
+                        order.price_tick <= price_tick
+                    }
                 })
                 .map(|order| {
                     (
+                        order.side,
                         order.price_tick,
                         self.trade_only_orders[&order.order_id].active_after,
                         order.order_id,
@@ -556,16 +546,42 @@ where
                 })
                 .collect();
             eligible.sort_unstable_by(|a, b| {
-                let price_order = if side == Side::Buy {
-                    b.0.cmp(&a.0)
-                } else {
-                    a.0.cmp(&b.0)
-                };
-                price_order.then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
+                // Maker fills first, then reference checks, each in price/time/id order.
+                (a.0 != side)
+                    .cmp(&(b.0 != side))
+                    .then_with(|| {
+                        if a.0 == Side::Buy {
+                            b.1.cmp(&a.1)
+                        } else {
+                            a.1.cmp(&b.1)
+                        }
+                    })
+                    .then(a.2.cmp(&b.2))
+                    .then(a.3.cmp(&b.3))
             });
-            for (_, _, id) in eligible {
+            for (_, _, _, id) in eligible {
                 let order = orders.get_mut(&id).unwrap();
-                if side == Side::Buy {
+                if order.side != side {
+                    self.trade_only_orders
+                        .get_mut(&id)
+                        .unwrap()
+                        .awaiting_reference = false;
+                    let crosses = if order.side == Side::Buy {
+                        order.price_tick >= price_tick
+                    } else {
+                        order.price_tick <= price_tick
+                    };
+                    if crosses {
+                        self.filled_orders.push(id);
+                        if order.time_in_force == TimeInForce::GTX {
+                            order.status = Status::Expired;
+                            order.exch_timestamp = event.exch_ts;
+                            self.order_e2l.respond(order.clone());
+                        } else {
+                            self.fill::<true>(order, event.exch_ts, false, price_tick)?;
+                        }
+                    }
+                } else if side == Side::Buy {
                     self.check_if_buy_filled(order, price_tick, event.qty, event.exch_ts)?;
                 } else {
                     self.check_if_sell_filled(order, price_tick, event.qty, event.exch_ts)?;

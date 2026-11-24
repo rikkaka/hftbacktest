@@ -55,35 +55,51 @@ This option is not exposed by the level-3 or Python builders.
 
 ## Execution rules
 
-- Only **opposing-aggressor exchange trade events** trigger fills. A sell trade
-  can fill a buy order at or above its price; a buy trade can fill a sell order
-  at or below its price. Same-price trades must also exhaust the queue ahead.
+- The **first same-side aggressor trade** after acceptance estimates the opposite
+  quote: a buy trade supplies an ask for our buy order; a sell trade supplies a
+  bid for our sell order. If the limit crosses or equals that reference, GTC
+  executes at the **reference trade price as taker**, and GTX expires. There is
+  no need to wait for both sides. A noncrossing first reference completes this
+  check; later same-side trades cannot turn the resting order into a taker.
+- **Opposing-aggressor trades** can fill as maker at the **order limit price**,
+  including while waiting for the reference. A sell trade can fill a buy order
+  at or above its price; a buy trade can fill a sell order at or below its price.
+  Same-price trades must also exhaust the queue ahead. An earlier maker fill
+  wins and is never reclassified when a later reference arrives.
 - New and repriced orders cannot use trades with timestamps at or before their
   exchange acceptance time. Quantity reductions preserve queue priority and
-  eligibility; increases and repricing reinitialize them.
-- All fills execute at the **order limit price**, including orders that crossed
-  the recorded book at acceptance. The cached best bid/ask never supplies an
-  execution price in this mode.
+  eligibility and the reference-check state; increases and repricing reinitialize
+  them. Trades at the acceptance timestamp do not consume the first reference.
+- For example, a buy limit at 100 followed first by an aggressor buy at 99
+  executes at 99 as taker. If an aggressor sell at 98 arrives first, it instead
+  executes at 100 as maker, before the reference is available.
+- Fills and GTX expiry use the **triggering trade's exchange timestamp**, then
+  the configured response latency. Nothing is backdated to order acceptance,
+  and the strategy receives no future trade information. Within one trade event,
+  maker candidates are processed before reference checks, each in price/time/id
+  order. The cached best bid/ask never supplies an execution price.
 - Book updates initialize the book, but never trigger fills or advance an
   existing order's queue. Initial queue depth still comes from the book.
 - The no-partial-fill assumption is retained: an eligible fill executes the
   whole remaining order, without sharing a finite trade-volume budget across
   simulated orders. This mode is not an exact market-impact simulation.
 - Order entry, cancel, modify and response delays still use the latency model.
-  An order can fill while its cancellation is in flight.
+  An order can fill while its cancellation is in flight. A cancellation that has
+  already reached the exchange removes the order and its pending reference check.
+  If no reference or eligible opposing trade arrives, the order remains unfilled;
+  there is no fallback to a cached quote.
 
 Only **GTC and GTX limit orders** are supported. Market, IOC and FOK requests
-return `BacktestError::InvalidOrderRequest`. GTX orders crossing the recorded
-book are still expired at acceptance.
+return `BacktestError::InvalidOrderRequest`. GTX is initially acknowledged and
+can expire later on its first reference; the recorded book cannot reject it.
 
 ## Fees and remaining book dependence
 
-Fee classification is estimated at acceptance/requeue. A GTC order crossing
-the then-recorded book is charged taker fees when it eventually fills; other
-accepted orders are charged maker fees. This label does not trigger a fill or
-grant book-price improvement. Reducing quantity preserves the label.
+Fees follow the simulated execution: first-reference fills pay taker fees;
+opposing-trade fills pay maker fees. The recorded BBO does not classify fees.
 
-This is an approximation: delayed book timestamps can still affect initial
-queue depth, GTX rejection and the maker/taker fee classification. The option
-removes **book-triggered executions**; it does not reconstruct missing book
-transaction timestamps or establish the true maker/taker identity.
+This is still an approximation: the first same-side trade need not represent
+the best quote at acceptance and may arrive later. It supplies a price, not
+available depth. Initial queue size still comes from the recorded book, and
+the no-partial-fill model does not constrain taker quantity to that trade's
+quantity. This mode does not reconstruct the exact historical BBO.

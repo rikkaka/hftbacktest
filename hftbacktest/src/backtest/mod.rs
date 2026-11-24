@@ -137,10 +137,12 @@ pub enum MatchingMode {
     /// Match on both order-book updates and trades, including immediate liquidity taking.
     #[default]
     BookAndTrade,
-    /// Match only on subsequent opposing-aggressor trades, at the order's limit price.
+    /// Match only on subsequent trades, with a one-time same-side reference for liquidity taking.
     ///
-    /// Book data still initializes queue positions, checks GTX orders and estimates maker/taker
-    /// fees at acceptance. Depth updates do not advance queues or trigger executions.
+    /// The first same-side aggressor trade estimates the opposite quote: crossing GTC orders
+    /// take at that price, while GTX orders expire. Opposing trades can fill as maker at the
+    /// limit price, even before that reference. Book data only initializes queue positions;
+    /// depth updates do not advance queues, trigger executions or classify fees.
     /// Only GTC/GTX limit orders with [`ExchangeKind::NoPartialFillExchange`] are supported.
     TradeOnly,
 }
