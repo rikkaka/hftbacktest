@@ -102,12 +102,13 @@ fn first_same_side_trade_takes_at_reference_price_and_time() {
         ex.process(&event(reference_trade, 10, reference_price, 1.0))
             .unwrap();
         ex.process(&event(opposing_trade, 10, 100.0, 1.0)).unwrap();
+        ex.process(&event(opposing_trade, 11, 100.0, 1.0)).unwrap();
         ex.process(&event(EXCH_BID_DEPTH_EVENT, 12, 103.0, 10.0))
             .unwrap();
         ex.process(&event(EXCH_ASK_DEPTH_EVENT, 13, 97.0, 10.0))
             .unwrap();
         assert_eq!(ex.state.values().num_trades, 0);
-        assert!(ex.trade_only_orders[&1].awaiting_reference);
+        assert!(ex.trade_only_orders[&1].reference_at.is_none());
         ex.process(&event(reference_trade, 14, reference_price, 1.0))
             .unwrap();
         assert_eq!(ex.state.values().trading_volume, 2.0);
@@ -148,7 +149,7 @@ fn noncrossing_first_reference_cannot_be_replaced_by_later_trades() {
             ex.ack_new(&mut resting, 1).unwrap();
             assert_eq!(resting.status, Status::New);
             ex.process(&event(reference_trade, 2, first, 1.0)).unwrap();
-            assert!(!ex.trade_only_orders[&1].awaiting_reference);
+            assert!(ex.trade_only_orders[&1].reference_at.is_some());
             ex.process(&event(reference_trade, 3, later, 1.0)).unwrap();
             assert_eq!(ex.state.values().num_trades, 0);
             ex.process(&event(opposing_trade, 4, later, 1.0)).unwrap();
@@ -164,12 +165,10 @@ fn one_trade_handles_makers_and_first_references_in_price_time_order() {
     let mut ex = exchange(MatchingMode::TradeOnly);
     let (bus, mut local) = order_bus(ConstantLatency::new(0, 0));
     ex.order_e2l = bus;
-    for (id, side, price) in [
-        (2, Side::Buy, 100),
-        (4, Side::Buy, 98),
-        (3, Side::Sell, 98),
-        (1, Side::Buy, 102),
-    ] {
+    ex.ack_new(&mut order(3, Side::Sell, 98, 1.0), 0).unwrap();
+    ex.process(&event(EXCH_SELL_TRADE_EVENT, 1, 97.0, 1.0))
+        .unwrap();
+    for (id, side, price) in [(2, Side::Buy, 100), (4, Side::Buy, 98), (1, Side::Buy, 102)] {
         ex.ack_new(&mut order(id, side, price, 1.0), 1).unwrap();
     }
     ex.process(&event(EXCH_BUY_TRADE_EVENT, 2, 99.0, 1.0))
@@ -183,7 +182,7 @@ fn one_trade_handles_makers_and_first_references_in_price_time_order() {
     }
     assert!(local.earliest_recv_order_timestamp().is_none());
     assert_eq!(ex.orders.borrow().len(), 1);
-    assert!(!ex.trade_only_orders[&4].awaiting_reference);
+    assert!(ex.trade_only_orders[&4].reference_at.is_some());
     // A newly accepted order gets its own first reference; the resting order does not.
     ex.ack_new(&mut order(5, Side::Buy, 98, 1.0), 3).unwrap();
     ex.process(&event(EXCH_BUY_TRADE_EVENT, 4, 97.0, 1.0))
@@ -197,41 +196,78 @@ fn one_trade_handles_makers_and_first_references_in_price_time_order() {
 }
 
 #[test]
-fn same_price_queue_only_advances_on_trades() {
-    for (side, price, depth, trade) in [
-        (Side::Buy, 99, EXCH_BID_DEPTH_EVENT, EXCH_SELL_TRADE_EVENT),
-        (Side::Sell, 101, EXCH_ASK_DEPTH_EVENT, EXCH_BUY_TRADE_EVENT),
+fn same_price_queue_only_advances_after_reference() {
+    for (side, price, depth, trade, reference, reference_price) in [
+        (
+            Side::Buy,
+            99,
+            EXCH_BID_DEPTH_EVENT,
+            EXCH_SELL_TRADE_EVENT,
+            EXCH_BUY_TRADE_EVENT,
+            101.0,
+        ),
+        (
+            Side::Sell,
+            101,
+            EXCH_ASK_DEPTH_EVENT,
+            EXCH_BUY_TRADE_EVENT,
+            EXCH_SELL_TRADE_EVENT,
+            99.0,
+        ),
     ] {
-        let mut ex = exchange(MatchingMode::TradeOnly);
-        ex.ack_new(&mut order(1, side, price, 3.0), 1).unwrap();
-        ex.process(&event(depth, 2, price as f64, 0.0)).unwrap();
-        ex.process(&event(trade, 3, price as f64, 10.0)).unwrap();
-        assert_eq!(ex.state.values().num_trades, 0);
-        ex.process(&event(trade, 4, price as f64, 1.0)).unwrap();
-        assert_eq!(ex.state.values().trading_volume, 3.0);
-        assert_eq!(ex.state.values().fee, 0.0);
+        for tif in [TimeInForce::GTC, TimeInForce::GTX] {
+            let mut ex = exchange(MatchingMode::TradeOnly);
+            let mut resting = order(1, side, price, 3.0);
+            resting.time_in_force = tif;
+            ex.ack_new(&mut resting, 1).unwrap();
+            ex.process(&event(depth, 2, price as f64, 0.0)).unwrap();
+            ex.process(&event(trade, 2, price as f64, 100.0)).unwrap();
+            assert_eq!(ex.state.values().num_trades, 0);
+            ex.process(&event(reference, 3, reference_price, 1.0))
+                .unwrap();
+            ex.process(&event(trade, 3, price as f64, 100.0)).unwrap();
+            ex.process(&event(trade, 4, price as f64, 10.0)).unwrap();
+            assert_eq!(ex.state.values().num_trades, 0);
+            ex.process(&event(trade, 5, price as f64, 1.0)).unwrap();
+            assert_eq!(ex.state.values().trading_volume, 3.0);
+            assert_eq!(ex.state.values().fee, 0.0);
+        }
     }
 }
 
 #[test]
-fn opposing_trade_can_fill_as_maker_before_reference_despite_crossed_book() {
-    for (side, price, trade, px) in [
-        (Side::Sell, 90, EXCH_BUY_TRADE_EVENT, 91.0),
-        (Side::Buy, 110, EXCH_SELL_TRADE_EVENT, 109.0),
+fn maker_fill_requires_a_strictly_earlier_noncrossing_reference() {
+    for (side, price, trade, px, reference_price) in [
+        (Side::Sell, 90, EXCH_BUY_TRADE_EVENT, 91.0, 89.0),
+        (Side::Buy, 110, EXCH_SELL_TRADE_EVENT, 109.0, 111.0),
     ] {
-        let mut ex = exchange(MatchingMode::TradeOnly);
-        ex.ack_new(&mut order(1, side, price, 1.0), 1).unwrap();
-        ex.process(&event(trade, 2, px, 1.0)).unwrap();
-        assert_eq!(ex.state.values().num_trades, 1);
-        assert_eq!(ex.state.values().trading_value, price as f64);
-        assert_eq!(ex.state.values().fee, 0.0);
-        let reference = if side == Side::Buy {
-            EXCH_BUY_TRADE_EVENT
-        } else {
-            EXCH_SELL_TRADE_EVENT
-        };
-        ex.process(&event(reference, 3, px, 1.0)).unwrap();
-        assert_eq!(ex.state.values().num_trades, 1);
+        for tif in [TimeInForce::GTC, TimeInForce::GTX] {
+            let mut ex = exchange(MatchingMode::TradeOnly);
+            let mut resting = order(1, side, price, 2.0);
+            resting.time_in_force = tif;
+            ex.ack_new(&mut resting, 1).unwrap();
+            // A reduction while pending must not grant maker eligibility.
+            resting.qty = 1.0;
+            ex.ack_modify::<false>(&mut resting, 2).unwrap();
+            ex.process(&event(trade, 2, px, 1.0)).unwrap();
+            assert_eq!(ex.state.values().num_trades, 0);
+            let reference = if side == Side::Buy {
+                EXCH_BUY_TRADE_EVENT
+            } else {
+                EXCH_SELL_TRADE_EVENT
+            };
+            ex.process(&event(reference, 3, reference_price, 1.0))
+                .unwrap();
+            ex.process(&event(trade, 3, px, 1.0)).unwrap();
+            ex.process(&event(trade, 2, px, 1.0)).unwrap();
+            assert_eq!(ex.state.values().num_trades, 0);
+            assert_eq!(ex.trade_only_orders[&1].active_after, 1);
+            assert_eq!(ex.trade_only_orders[&1].reference_at, Some(3));
+            ex.process(&event(trade, 4, px, 1.0)).unwrap();
+            assert_eq!(ex.state.values().num_trades, 1);
+            assert_eq!(ex.state.values().trading_value, price as f64);
+            assert_eq!(ex.state.values().fee, 0.0);
+        }
     }
 }
 
@@ -242,16 +278,16 @@ fn reduction_preserves_queue_and_activation_but_increase_or_reprice_requeues() {
     ex.ack_new(&mut buy, 1).unwrap();
     ex.process(&event(EXCH_BUY_TRADE_EVENT, 2, 101.0, 1.0))
         .unwrap();
-    ex.process(&event(EXCH_SELL_TRADE_EVENT, 2, 99.0, 6.0))
+    ex.process(&event(EXCH_SELL_TRADE_EVENT, 3, 99.0, 6.0))
         .unwrap();
     buy.qty = 3.0;
-    ex.ack_modify::<false>(&mut buy, 3).unwrap();
+    ex.ack_modify::<false>(&mut buy, 4).unwrap();
     assert_eq!(ex.trade_only_orders[&1].active_after, 1);
-    assert!(!ex.trade_only_orders[&1].awaiting_reference);
-    ex.process(&event(EXCH_BUY_TRADE_EVENT, 3, 98.0, 1.0))
+    assert_eq!(ex.trade_only_orders[&1].reference_at, Some(2));
+    ex.process(&event(EXCH_BUY_TRADE_EVENT, 4, 98.0, 1.0))
         .unwrap();
     assert_eq!(ex.state.values().position, 0.0);
-    ex.process(&event(EXCH_SELL_TRADE_EVENT, 3, 99.0, 5.0))
+    ex.process(&event(EXCH_SELL_TRADE_EVENT, 4, 99.0, 5.0))
         .unwrap();
     assert_eq!(ex.state.values().position, 3.0);
 
@@ -259,13 +295,13 @@ fn reduction_preserves_queue_and_activation_but_increase_or_reprice_requeues() {
     ex.ack_new(&mut buy, 4).unwrap();
     ex.process(&event(EXCH_BUY_TRADE_EVENT, 5, 101.0, 1.0))
         .unwrap();
-    ex.process(&event(EXCH_SELL_TRADE_EVENT, 5, 99.0, 6.0))
+    ex.process(&event(EXCH_SELL_TRADE_EVENT, 6, 99.0, 6.0))
         .unwrap();
     buy.qty = 4.0;
     ex.ack_modify::<false>(&mut buy, 6).unwrap();
     assert_eq!(buy.leaves_qty, 4.0);
     assert_eq!(ex.trade_only_orders[&2].active_after, 6);
-    assert!(ex.trade_only_orders[&2].awaiting_reference);
+    assert!(ex.trade_only_orders[&2].reference_at.is_none());
     ex.process(&event(EXCH_BUY_TRADE_EVENT, 6, 98.0, 1.0))
         .unwrap();
     ex.process(&event(EXCH_SELL_TRADE_EVENT, 6, 99.0, 11.0))
@@ -275,10 +311,10 @@ fn reduction_preserves_queue_and_activation_but_increase_or_reprice_requeues() {
     assert_eq!(ex.state.values().position, 3.0);
     ex.process(&event(EXCH_BUY_TRADE_EVENT, 7, 101.0, 1.0))
         .unwrap();
-    assert!(!ex.trade_only_orders[&2].awaiting_reference);
+    assert!(ex.trade_only_orders[&2].reference_at.is_some());
     buy.price_tick = 102;
     ex.ack_modify::<false>(&mut buy, 8).unwrap();
-    assert!(ex.trade_only_orders[&2].awaiting_reference);
+    assert!(ex.trade_only_orders[&2].reference_at.is_none());
     assert_eq!(ex.state.values().position, 3.0);
     ex.process(&event(EXCH_SELL_TRADE_EVENT, 8, 100.0, 10.0))
         .unwrap();
@@ -330,7 +366,14 @@ fn rejects_unsupported_orders_and_expires_post_only_on_first_reference() {
         ex.ack_new(&mut post_only, 1).unwrap();
         assert_eq!(post_only.status, Status::New);
         ex.process(&event(trade, 1, px, 1.0)).unwrap();
-        assert!(ex.trade_only_orders[&1].awaiting_reference);
+        assert!(ex.trade_only_orders[&1].reference_at.is_none());
+        let opposing = if side == Side::Buy {
+            EXCH_SELL_TRADE_EVENT
+        } else {
+            EXCH_BUY_TRADE_EVENT
+        };
+        ex.process(&event(opposing, 2, px, 100.0)).unwrap();
+        assert_eq!(ex.state.values().num_trades, 0);
         ex.process(&event(trade, 2, px, 1.0)).unwrap();
         assert!(ex.orders.borrow().is_empty());
         assert!(ex.trade_only_orders.is_empty());
@@ -371,15 +414,37 @@ fn zec_aug22_stale_bid_cannot_trigger_take_profit() {
 #[test]
 fn builder_and_order_bus_preserve_entry_response_and_cancel_latencies() {
     for response in [20, 50] {
-        for first_trade in [EXCH_BUY_TRADE_EVENT, EXCH_SELL_TRADE_EVENT] {
+        for first_taker in [true, false] {
+            let first_reference = if first_taker { 100.0 } else { 103.0 };
+            let closing_reference = if first_taker { 101.0 } else { 103.0 };
             let data = Data::from_data(&[
                 event(EXCH_BID_DEPTH_EVENT | LOCAL_EVENT, 0, 99.0, 10.0),
                 event(EXCH_ASK_DEPTH_EVENT | LOCAL_EVENT, 0, 101.0, 10.0),
-                event(first_trade | LOCAL_EVENT, 100, 100.0, 10.0),
-                event(first_trade | LOCAL_EVENT, 101, 100.0, 10.0),
-                event(first_trade | LOCAL_EVENT, 300, 103.0, 10.0),
+                event(
+                    EXCH_BUY_TRADE_EVENT | LOCAL_EVENT,
+                    100,
+                    first_reference,
+                    10.0,
+                ),
+                event(EXCH_SELL_TRADE_EVENT | LOCAL_EVENT, 101, 100.0, 10.0),
+                event(
+                    EXCH_BUY_TRADE_EVENT | LOCAL_EVENT,
+                    102,
+                    first_reference,
+                    10.0,
+                ),
+                event(EXCH_SELL_TRADE_EVENT | LOCAL_EVENT, 103, 100.0, 10.0),
+                event(
+                    EXCH_SELL_TRADE_EVENT | LOCAL_EVENT,
+                    320,
+                    closing_reference,
+                    10.0,
+                ),
+                event(EXCH_BUY_TRADE_EVENT | LOCAL_EVENT, 321, 103.0, 10.0),
                 event(EXCH_BUY_TRADE_EVENT | LOCAL_EVENT, 500, 103.0, 10.0),
-                event(EXCH_BUY_TRADE_EVENT | LOCAL_EVENT, 1000, 103.0, 10.0),
+                event(EXCH_SELL_TRADE_EVENT | LOCAL_EVENT, 1000, 103.0, 10.0),
+                event(EXCH_BUY_TRADE_EVENT | LOCAL_EVENT, 1001, 103.0, 10.0),
+                event(EXCH_BID_DEPTH_EVENT | LOCAL_EVENT, 1200, 99.0, 10.0),
             ]);
             let asset = || {
                 L2AssetBuilder::new()
@@ -404,31 +469,30 @@ fn builder_and_order_bus_preserve_entry_response_and_cancel_latencies() {
             hbt.elapse(0).unwrap();
             hbt.submit_buy_order(0, 1, 102.0, 1.0, TimeInForce::GTC, OrdType::Limit, false)
                 .unwrap();
-            hbt.elapse(100 + response).unwrap();
+            hbt.elapse(101 + response).unwrap();
             assert_eq!(hbt.position(0), 0.0);
-            hbt.elapse(1).unwrap();
+            hbt.elapse(2).unwrap();
             assert_eq!(hbt.position(0), 1.0);
             let buy = &hbt.orders(0)[&1];
-            assert_eq!(buy.exch_timestamp, 101);
-            let maker = first_trade == EXCH_SELL_TRADE_EVENT;
-            assert_eq!(buy.exec_price(), if maker { 102.0 } else { 100.0 });
-            assert_eq!(buy.maker, maker);
+            assert_eq!(buy.exch_timestamp, if first_taker { 102 } else { 103 });
+            assert_eq!(buy.exec_price(), if first_taker { 100.0 } else { 102.0 });
+            assert_eq!(buy.maker, !first_taker);
             hbt.submit_sell_order(0, 2, 102.0, 1.0, TimeInForce::GTC, OrdType::Limit, true)
                 .unwrap();
             hbt.cancel(0, 2, false).unwrap();
-            // The trade at 300 happens while cancellation is still in flight.
-            hbt.elapse(300 + response - hbt.current_timestamp())
+            // Confirmation and the subsequent trade arrive while cancellation is in flight.
+            hbt.elapse(321 + response - hbt.current_timestamp())
                 .unwrap();
             assert_eq!(hbt.position(0), 0.0);
             let sell = &hbt.orders(0)[&2];
-            assert_eq!(sell.maker, !maker);
-            assert_eq!(sell.exec_price(), if maker { 103.0 } else { 102.0 });
-            assert_eq!(sell.exch_timestamp, 300);
+            assert_eq!(sell.maker, first_taker);
+            assert_eq!(sell.exec_price(), if first_taker { 102.0 } else { 103.0 });
+            assert_eq!(sell.exch_timestamp, if first_taker { 321 } else { 320 });
             hbt.elapse(200).unwrap();
             hbt.submit_sell_order(0, 3, 102.0, 1.0, TimeInForce::GTC, OrdType::Limit, true)
                 .unwrap();
             hbt.cancel(0, 3, true).unwrap();
-            hbt.elapse(1000 + response - hbt.current_timestamp())
+            hbt.elapse(1001 + response - hbt.current_timestamp())
                 .unwrap();
             assert_eq!(hbt.orders(0)[&3].status, Status::Canceled);
             assert_eq!(hbt.position(0), 0.0);

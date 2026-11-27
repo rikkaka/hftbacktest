@@ -61,18 +61,23 @@ This option is not exposed by the level-3 or Python builders.
   executes at the **reference trade price as taker**, and GTX expires. There is
   no need to wait for both sides. A noncrossing first reference completes this
   check; later same-side trades cannot turn the resting order into a taker.
-- **Opposing-aggressor trades** can fill as maker at the **order limit price**,
-  including while waiting for the reference. A sell trade can fill a buy order
+- **Both GTC and GTX wait for the first same-side reference before any maker
+  execution.** Opposing-aggressor trades received while waiting neither fill
+  the order nor consume its queue ahead. After a noncrossing reference, only
+  opposing trades with exchange timestamps **strictly later than the reference**
+  can fill as maker at the **order limit price**. A sell trade can fill a buy order
   at or above its price; a buy trade can fill a sell order at or below its price.
-  Same-price trades must also exhaust the queue ahead. An earlier maker fill
-  wins and is never reclassified when a later reference arrives.
+  Same-price trades must also exhaust the queue ahead.
 - New and repriced orders cannot use trades with timestamps at or before their
   exchange acceptance time. Quantity reductions preserve queue priority and
   eligibility and the reference-check state; increases and repricing reinitialize
   them. Trades at the acceptance timestamp do not consume the first reference.
+  Trades at the reference timestamp cannot execute as maker or advance the queue.
+  Reference confirmation preserves the original acceptance time used for priority.
 - For example, a buy limit at 100 followed first by an aggressor buy at 99
-  executes at 99 as taker. If an aggressor sell at 98 arrives first, it instead
-  executes at 100 as maker, before the reference is available.
+  executes at 99 as taker (or expires for GTX). An aggressor sell at 98 arriving
+  before that reference is ignored. If the first aggressor buy is instead 101,
+  the order rests; a strictly later aggressor sell at 98 can fill it at 100 as maker.
 - Fills and GTX expiry use the **triggering trade's exchange timestamp**, then
   the configured response latency. Nothing is backdated to order acceptance,
   and the strategy receives no future trade information. Within one trade event,

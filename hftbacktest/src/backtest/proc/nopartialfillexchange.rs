@@ -91,7 +91,7 @@ where
 
 struct TradeOnlyOrder {
     active_after: i64,
-    awaiting_reference: bool,
+    reference_at: Option<i64>,
 }
 
 impl<AT, LM, QM, MD, FM> NoPartialFillExchange<AT, LM, QM, MD, FM>
@@ -127,8 +127,8 @@ where
     ///
     /// In [`MatchingMode::TradeOnly`], the first same-side aggressor trade strictly after
     /// acceptance (or requeue) supplies an estimated opposite quote. Crossing GTC orders take
-    /// at that trade price; GTX orders expire. Opposing-aggressor trades can fill as maker at
-    /// the limit price, including before the reference arrives. Depth changes neither execute
+    /// at that trade price; GTX orders expire. Only trades strictly after a noncrossing reference
+    /// can fill as maker at the limit price or advance queues. Depth changes neither execute
     /// orders nor advance queues. Responses use the triggering trade time, never acceptance time.
     pub fn matching_mode(self, matching_mode: MatchingMode) -> Self {
         Self {
@@ -139,7 +139,9 @@ where
 
     fn trade_is_eligible(&self, order_id: OrderId, timestamp: i64) -> bool {
         self.matching_mode != MatchingMode::TradeOnly
-            || timestamp > self.trade_only_orders[&order_id].active_after
+            || self.trade_only_orders[&order_id]
+                .reference_at
+                .is_some_and(|confirmed| timestamp > confirmed)
     }
 
     fn check_if_sell_filled(
@@ -505,7 +507,7 @@ where
             order.order_id,
             TradeOnlyOrder {
                 active_after: timestamp,
-                awaiting_reference: true,
+                reference_at: None,
             },
         );
         self.orders
@@ -529,7 +531,9 @@ where
                         return false;
                     }
                     if order.side != side {
-                        state.awaiting_reference
+                        state.reference_at.is_none()
+                    } else if !self.trade_is_eligible(order.order_id, event.exch_ts) {
+                        false
                     } else if side == Side::Buy {
                         order.price_tick >= price_tick
                     } else {
@@ -562,10 +566,7 @@ where
             for (_, _, _, id) in eligible {
                 let order = orders.get_mut(&id).unwrap();
                 if order.side != side {
-                    self.trade_only_orders
-                        .get_mut(&id)
-                        .unwrap()
-                        .awaiting_reference = false;
+                    self.trade_only_orders.get_mut(&id).unwrap().reference_at = Some(event.exch_ts);
                     let crosses = if order.side == Side::Buy {
                         order.price_tick >= price_tick
                     } else {

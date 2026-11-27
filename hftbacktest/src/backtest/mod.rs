@@ -141,7 +141,8 @@ pub enum MatchingMode {
     ///
     /// The first same-side aggressor trade estimates the opposite quote: crossing GTC orders
     /// take at that price, while GTX orders expire. Opposing trades can fill as maker at the
-    /// limit price, even before that reference. Book data only initializes queue positions;
+    /// limit price only strictly after a noncrossing reference. Until then, opposing trades
+    /// neither fill orders nor advance queues. Book data only initializes queue positions;
     /// depth updates do not advance queues, trigger executions or classify fees.
     /// Only GTC/GTX limit orders with [`ExchangeKind::NoPartialFillExchange`] are supported.
     TradeOnly,
